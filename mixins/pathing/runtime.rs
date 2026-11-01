@@ -14,7 +14,7 @@ use std::collections::{BinaryHeap, HashMap};
 #[allow(dead_code)]
 pub const ID: &str = "pathing";
 #[allow(dead_code)]
-pub const VERSION: &str = "0.1.0";
+pub const VERSION: &str = "0.1.1";
 
 #[allow(dead_code)]
 pub type Pos = [i32; 3];
@@ -482,6 +482,23 @@ pub struct Controls {
 }
 
 #[allow(dead_code)]
+/// Most the camera turns in a tick when lining up a sprint jump.
+const MAX_TURN_DEGREES: f32 = 35.0;
+/// A sprint jump waits until the camera is this close to the jump's direction.
+const ALIGN_DEGREES: f32 = 8.0;
+
+/// An angle in degrees, brought into (-180, 180].
+#[allow(dead_code)]
+pub fn wrap_degrees(a: f32) -> f32 {
+    let mut a = a % 360.0;
+    if a > 180.0 {
+        a -= 360.0;
+    } else if a <= -180.0 {
+        a += 360.0;
+    }
+    a
+}
+
 #[allow(dead_code)]
 /// Which of W, S, A and D (forward, back, left, right) move a player looking
 /// along `view_yaw` toward (dx, dz): the nearest of the eight directions.
@@ -535,13 +552,31 @@ impl Follower {
         }
     }
 
+    /// The yaw of a sprint jump that is this step or the next, and whether it
+    /// is this step.
+    fn jump_heading(&self) -> Option<(f32, bool)> {
+        let s = self.steps.get(self.next)?;
+        if s.kind == Kind::Parkour {
+            let (dx, dz) = (s.pos[0] - self.from[0], s.pos[2] - self.from[2]);
+            return Some((yaw_to(f64::from(dx), f64::from(dz)), true));
+        }
+        let n = self.steps.get(self.next + 1)?;
+        if n.kind == Kind::Parkour {
+            let (dx, dz) = (n.pos[0] - s.pos[0], n.pos[2] - s.pos[2]);
+            return Some((yaw_to(f64::from(dx), f64::from(dz)), false));
+        }
+        None
+    }
+
     pub fn remaining(&self) -> usize {
         self.steps.len() - self.next
     }
 
-    /// `view_yaw` is where the camera points now: with it, the controls steer
-    /// with W, A, S and D and never turn the camera; without it, they ask for
-    /// a yaw and walk forward.
+    /// `view_yaw` is where the camera points now. With it, the controls steer
+    /// with W, A, S and D and leave the camera alone, except around a sprint
+    /// jump: from the step before it, they turn the camera toward the jump
+    /// (`Controls::yaw`), and the jump waits until it is lined up. Without it,
+    /// they always ask for a yaw and walk forward.
     pub fn update(
         &mut self,
         pos: [f64; 3],
@@ -589,16 +624,37 @@ impl Follower {
         }
 
         let (to_x, to_z) = (s.pos[0] as f64 + 0.5 - pos[0], s.pos[2] as f64 + 0.5 - pos[2]);
-        let (forward, back, left, right, yaw) = match view_yaw {
+        let (forward, back, left, right, yaw, hold) = match view_yaw {
             Some(view) => {
-                let (f, b, l, r) = if dh > 0.05 {
-                    wasd(view, to_x, to_z)
-                } else {
+                // Facing: where the camera is after this tick's turn, if a
+                // sprint jump needs it turned.
+                let mut face = view;
+                let mut turned = None;
+                let mut hold = false;
+                if let Some((heading, on_jump)) = self.jump_heading() {
+                    let turn = wrap_degrees(heading - view).clamp(-MAX_TURN_DEGREES, MAX_TURN_DEGREES);
+                    if turn.abs() > 0.01 {
+                        face = view + turn;
+                        turned = Some(face);
+                    }
+                    // Wait for the camera on the jump itself, not on the walk to it.
+                    hold = on_jump && wrap_degrees(heading - face).abs() > ALIGN_DEGREES;
+                }
+                let (f, b, l, r) = if hold || dh <= 0.05 {
                     (false, false, false, false)
+                } else {
+                    wasd(face, to_x, to_z)
                 };
-                (f, b, l, r, None)
+                (f, b, l, r, turned, hold)
             }
-            None => (true, false, false, false, if dh > 0.05 { Some(yaw_to(to_x, to_z)) } else { None }),
+            None => (
+                true,
+                false,
+                false,
+                false,
+                if dh > 0.05 { Some(yaw_to(to_x, to_z)) } else { None },
+                false,
+            ),
         };
         let jump = match s.kind {
             Kind::Ascend => dy > 0.5 && dh < 1.6 && on_ground,
@@ -607,7 +663,7 @@ impl Follower {
                     .abs()
                     .max((s.pos[2] - self.from[2]).abs());
                 let gap = (span - 1).max(0) as f64;
-                on_ground && dh <= gap + 0.65
+                on_ground && !hold && dh <= gap + 0.65
             }
             Kind::Swim => dy > 0.2 || (in_water && dy > -0.5),
             Kind::Traverse | Kind::Diagonal => in_water,
@@ -845,7 +901,7 @@ pub const HELP: [&str; 7] = [
     "/goto <x> <y> <z> <radius>  get within a radius of a block",
     "/path stop | status",
     "/path parkour|swim|diagonal|sprint|look on|off",
-    "  look on: turn the camera toward the target (off: steer with W A S D; sprint-jumps then need the gap in front of you)",
+    "  look on: always turn the camera toward the target (off: only to line up a sprint jump)",
     "/path fall <blocks> | nodes <count>",
 ];
 
@@ -1341,6 +1397,101 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    fn moving(f: Follow) -> Controls {
+        match f {
+            Follow::Moving(c) => c,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn wrap_degrees_stays_in_range() {
+        assert_eq!(wrap_degrees(190.0), -170.0);
+        assert_eq!(wrap_degrees(-190.0), 170.0);
+        assert_eq!(wrap_degrees(540.0), 180.0);
+        assert_eq!(wrap_degrees(-90.0), -90.0);
+    }
+
+    #[test]
+    fn camera_turns_for_a_sprint_jump_then_the_jump_goes() {
+        // Standing at the edge facing south; the gap is to the east (yaw -90).
+        let steps = vec![Step { pos: [2, 1, 0], kind: Kind::Parkour }];
+        let mut f = Follower::new(START, steps, false);
+        let at = [0.5, 1.0, 0.5];
+        let mut view = 0.0f32;
+        let mut turns = Vec::new();
+        for _ in 0..8 {
+            let c = moving(f.update(at, true, false, Some(view)));
+            if let Some(y) = c.yaw {
+                turns.push(y);
+                view = y;
+            }
+            if c.forward {
+                // Lined up: sprinting forward, and the camera is no longer being turned.
+                assert!(c.sprint);
+                assert!((view + 90.0).abs() <= ALIGN_DEGREES, "jumped facing {view}");
+                break;
+            }
+            // Still turning: standing still, no sprint and no jump.
+            assert!(!c.forward && !c.back && !c.left && !c.right && !c.sprint && !c.jump);
+        }
+        assert!(turns.len() >= 3 && turns.len() <= 4, "turned in {} steps: {turns:?}", turns.len());
+        assert!(turns.windows(2).all(|w| w[1] < w[0]), "turns are steady: {turns:?}");
+        // The following tick the camera is where it should be: no more turning.
+        let c = moving(f.update(at, true, false, Some(view)));
+        assert!(c.forward && c.sprint && c.yaw.is_none());
+    }
+
+    #[test]
+    fn the_jump_waits_for_the_camera() {
+        let steps = vec![Step { pos: [2, 1, 0], kind: Kind::Parkour }];
+        let mut f = Follower::new(START, steps, false);
+        // Right at the edge (dh within jump range), but facing the wrong way.
+        let c = moving(f.update([0.95, 1.0, 0.5], true, false, Some(0.0)));
+        assert!(!c.jump && !c.forward);
+        // Facing the gap: it jumps.
+        let c = moving(f.update([0.95, 1.0, 0.5], true, false, Some(-90.0)));
+        assert!(c.jump && c.forward && c.sprint);
+    }
+
+    #[test]
+    fn camera_turns_on_the_way_to_a_jump_but_keeps_walking() {
+        // Walk one block south, then jump east from there.
+        let steps = vec![
+            Step { pos: [0, 1, 1], kind: Kind::Traverse },
+            Step { pos: [2, 1, 1], kind: Kind::Parkour },
+        ];
+        let mut f = Follower::new(START, steps, false);
+        let c = moving(f.update([0.5, 1.0, 0.5], true, false, Some(0.0)));
+        assert_eq!(c.yaw, Some(-35.0)); // turning toward the jump while walking
+        assert!(c.forward || c.right, "still walking: {c:?}");
+        assert!(!c.sprint || c.forward);
+    }
+
+    #[test]
+    fn the_camera_is_left_alone_away_from_jumps() {
+        let steps = vec![
+            Step { pos: [1, 1, 0], kind: Kind::Traverse },
+            Step { pos: [2, 1, 0], kind: Kind::Traverse },
+            Step { pos: [3, 1, 0], kind: Kind::Traverse },
+            Step { pos: [4, 1, 0], kind: Kind::Parkour },
+        ];
+        let mut f = Follower::new(START, steps, false);
+        // Two steps from the jump: nothing yet.
+        assert_eq!(moving(f.update([0.5, 1.0, 0.5], true, false, Some(0.0))).yaw, None);
+        assert_eq!(moving(f.update([1.5, 1.0, 0.5], true, false, Some(0.0))).yaw, None);
+        // On the step before the jump: the camera starts to turn.
+        assert!(moving(f.update([2.5, 1.0, 0.5], true, false, Some(0.0))).yaw.is_some());
+    }
+
+    #[test]
+    fn look_mode_still_always_turns() {
+        let steps = vec![Step { pos: [1, 1, 0], kind: Kind::Traverse }];
+        let mut f = Follower::new(START, steps, false);
+        let c = moving(f.update([0.5, 1.0, 0.5], true, false, None));
+        assert!(c.forward && (c.yaw.unwrap() + 90.0).abs() < 1e-3);
     }
 
     // A toy player. With `view` it keeps its camera fixed and moves by the
