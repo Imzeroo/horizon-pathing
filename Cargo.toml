@@ -1,0 +1,11 @@
+[package]
+name = "pathing"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+description = "A Baritone-style pathfinder for Horizon: /goto x y z"
+
+[lib]
+# This exact source is also injected as a same-crate module by horizon-mixins.
+path = "mixins/pathing/runtime.rs"
