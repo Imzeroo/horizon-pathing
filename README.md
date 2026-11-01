@@ -10,19 +10,40 @@ the old `horizon-ctl goto` did.
     /goto <x> <z>               walk to a column, at any height
     /goto <x> <y> <z> <radius>  get within a radius of a block
     /path stop | status | help
-    /path parkour|swim|diagonal|sprint on|off
+    /path parkour|swim|diagonal|sprint|look|debug on|off
     /path fall <blocks>         longest planned drop (default 3, which never hurts)
     /path nodes <count>         search size per plan (default 20000)
 
 ## What it does
 
 - Moves: walk, diagonal (no corner cutting), step up one block, drop up to
-  `fall` blocks, swim, and (off by default) sprint-jump across gaps of 1-2.
+  `fall` blocks, swim, and (off by default) sprint-jump across gaps of 1 to 3 missing blocks (see below).
 - Avoids lava, fire, cactus, magma, berry bushes, cobweb, powder snow and
   unloaded chunks. Never plans a fall longer than `fall`.
 - Plans a few hundred nodes a tick, so the game doesn't stall. If a plan runs
   out of nodes it walks to the closest point and plans again from there.
 - Replans up to three times when stuck (no progress for 3 s, or far off path).
+- Steers with W, A, S and D relative to where the camera already points, and
+  leaves the camera alone (eight directions, so the path wobbles by up to
+  22.5 degrees a tick and corrects).
+- Takes the camera only for a sprint jump: from the step before it, the camera
+  turns (35 degrees a tick at most) toward the jump, the jump waits until it is
+  within 8 degrees, and then it sprints and jumps. After the jump the camera is
+  left where it is. Sprinting needs the forward key, which is why the camera has
+  to face the gap. `/path look on` turns the camera toward the target the whole
+  time instead.
+- Sprint jumps cover gaps of 1, 2 or 3 missing blocks (landing 2, 3 or 4 blocks
+  from the takeoff) and need a straight, level runway behind the takeoff: none
+  for a gap of 1, 2 blocks for a gap of 2, 3 blocks for a gap of 3. The planner
+  only plans a jump that has the runway, and the follower walks back to the
+  start of the runway, then runs up and jumps at the edge. A gap of 4 or more
+  is not planned.
+- Sprinting also needs the forward key, so walking steps only sprint while the
+  camera faces roughly the way it is going (`/path look on` always does).
+- `/path debug on` says what each plan is made of, for example
+  "Plan of 7 steps (6 walk, 1 sprint jump, jump gaps: 3); reaches the goal". If
+  a jump you expected is not in the plan, the planner did not see a way (gap too
+  wide, no runway, or something in the way).
 - Stops if a screen opens. `/path stop` releases the keys.
 
 ## What it does not do (yet)
@@ -34,13 +55,13 @@ the old `horizon-ctl goto` did.
   stairs and slabs, and walking into fences.
 - No ladders, vines, scaffolding, boats or elytra. No hunger, mob or
   damage awareness.
-- Parkour jump timing is a first guess and needs tuning in a real game.
+- Parkour timing (when to jump, how far back the runway starts) is a first guess and needs tuning in a real game.
 
 ## Layout
 
     mixins/pathing/runtime.rs       the pathfinder: pure Rust, no game types.
                                     Also the Cargo library, so `cargo test`
-                                    runs its 34 tests.
+                                    runs its 57 tests.
     mixins/pathing/glue.rs          the game side: reads blocks, holds keys
     mixins/pathing/{tick,command,commands,list}.rs   the four hooks
     mixins/pathing/horizon-mixin.toml, compatibility.json
@@ -67,7 +88,7 @@ breaks it, the compile error will name the field.
 
 ## Tested
 
-- `cargo test` (edition 2024, Rust 1.99): 34 tests pass. They cover the search,
+- `cargo test` (edition 2024, Rust 1.99): 57 tests pass. They cover the search,
   every move type, the follower, the replanning loop against a toy player, the
   block classifier and the command parser.
 - The mod applied to Horizon a4873dec with horizon-mixins a2af5c0 and the whole

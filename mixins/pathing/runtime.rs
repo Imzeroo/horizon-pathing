@@ -14,7 +14,7 @@ use std::collections::{BinaryHeap, HashMap};
 #[allow(dead_code)]
 pub const ID: &str = "pathing";
 #[allow(dead_code)]
-pub const VERSION: &str = "0.1.1";
+pub const VERSION: &str = "0.1.3";
 
 #[allow(dead_code)]
 pub type Pos = [i32; 3];
@@ -60,6 +60,8 @@ pub struct Options {
     /// Turn the camera toward the target and walk forward, instead of leaving
     /// the camera alone and steering with W, A, S and D.
     pub turn_camera: bool,
+    /// Describe each plan in chat (`/path debug on`).
+    pub announce_plans: bool,
 }
 
 #[allow(dead_code)]
@@ -73,6 +75,7 @@ impl Default for Options {
             water_cost: 2.0,
             max_nodes: 20_000,
             turn_camera: false,
+            announce_plans: false,
         }
     }
 }
@@ -181,6 +184,17 @@ fn valid<W: WorldView>(w: &W, o: &Options, p: Pos) -> bool {
 }
 
 #[allow(dead_code)]
+/// Blocks of straight, level ground a sprint jump over `gap` missing blocks
+/// needs behind its takeoff: a standing start only clears a gap of one.
+#[allow(dead_code)]
+pub fn run_up(gap: i32) -> i32 {
+    match gap {
+        ..=1 => 0,
+        2 => 2,
+        _ => 3,
+    }
+}
+
 const CARDINALS: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
 #[allow(dead_code)]
 const DIAGONALS: [(i32, i32); 4] = [(1, 1), (1, -1), (-1, 1), (-1, -1)];
@@ -238,9 +252,10 @@ fn neighbors<W: WorldView>(w: &W, o: &Options, p: Pos, out: &mut Vec<(Pos, Kind,
                 k += 1;
             }
         }
-        // Parkour: a flat sprint jump over a gap of one or two blocks.
+        // Parkour: a flat sprint jump over a gap of one to three blocks, from a
+        // takeoff with a straight runway behind it (`run_up`).
         if o.allow_parkour && !here_water && body_ok(w, o, up(p, 2)) {
-            for gap in 1..=2 {
+            for gap in 1..=3 {
                 let landing = [x + dx * (gap + 1), y, z + dz * (gap + 1)];
                 let mut clear = true;
                 for i in 1..=gap {
@@ -250,6 +265,13 @@ fn neighbors<W: WorldView>(w: &W, o: &Options, p: Pos, out: &mut Vec<(Pos, Kind,
                         && body_ok(w, o, up(c, 2))
                         && w.cell(up(c, -1)) != Cell::Hazard)
                     {
+                        clear = false;
+                        break;
+                    }
+                }
+                for i in 1..=run_up(gap) {
+                    let b = [x - dx * i, y, z - dz * i];
+                    if !(valid(w, o, b) && w.cell(b) != Cell::Water && body_ok(w, o, up(b, 2))) {
                         clear = false;
                         break;
                     }
@@ -537,6 +559,8 @@ pub struct Follower {
     best: f64,
     stalled: u32,
     sprint: bool,
+    /// On the runway of a sprint jump and moving: no need to go back for a run-up.
+    running: bool,
 }
 
 #[allow(dead_code)]
@@ -549,7 +573,24 @@ impl Follower {
             best: f64::INFINITY,
             stalled: 0,
             sprint,
+            running: false,
         }
+    }
+
+    /// The next sprint jump among the next `ahead` steps: its takeoff block, its
+    /// direction, and the run-up it needs.
+    fn next_jump(&self, ahead: usize) -> Option<(Pos, (i32, i32), i32)> {
+        let end = (self.next + ahead).min(self.steps.len());
+        for i in self.next..end {
+            let s = self.steps[i];
+            if s.kind == Kind::Parkour {
+                let take = if i == self.next { self.from } else { self.steps[i - 1].pos };
+                let (dx, dz) = (s.pos[0] - take[0], s.pos[2] - take[2]);
+                let gap = dx.abs().max(dz.abs()) - 1;
+                return Some((take, (dx.signum(), dz.signum()), run_up(gap)));
+            }
+        }
+        None
     }
 
     /// The yaw of a sprint jump that is this step or the next, and whether it
@@ -601,6 +642,9 @@ impl Follower {
                 self.next += 1;
                 self.stalled = 0;
                 self.best = f64::INFINITY;
+                if s.kind == Kind::Parkour {
+                    self.running = false;
+                }
                 continue;
             }
             break;
@@ -609,10 +653,44 @@ impl Follower {
         let dh = horizontal(s.pos);
         let dy = s.pos[1] as f64 - pos[1];
 
-        if dh > 4.5 && horizontal(self.from) > 4.5 {
+        // A sprint jump over two or more blocks needs a run-up: on its
+        // runway, in line and far enough back, the player just runs; off it,
+        // the jump step starts by walking back to the runway's start.
+        let mut aim = s.pos;
+        let mut preparing = false;
+        if let Some((take, (ux, uz), run)) = self.next_jump(4) {
+            if run > 0 {
+                let (rx, rz) = (pos[0] - (take[0] as f64 + 0.5), pos[2] - (take[2] as f64 + 0.5));
+                let along = rx * f64::from(ux) + rz * f64::from(uz);
+                let lateral = (rx * f64::from(uz) - rz * f64::from(ux)).abs();
+                if along <= 0.0 - f64::from(run) + 0.35 && lateral < 0.35 {
+                    if !self.running {
+                        self.running = true;
+                        self.best = f64::INFINITY;
+                        self.stalled = 0;
+                    }
+                } else if lateral > 0.8 {
+                    self.running = false;
+                }
+                if s.kind == Kind::Parkour && !self.running {
+                    aim = [take[0] - ux * run, take[1], take[2] - uz * run];
+                    if horizontal(aim) < 0.35 {
+                        self.running = true;
+                        self.best = f64::INFINITY;
+                        self.stalled = 0;
+                        aim = s.pos;
+                    } else {
+                        preparing = true;
+                    }
+                }
+            }
+        }
+        let dh_aim = horizontal(aim);
+
+        if dh > 4.5 && horizontal(self.from) > 4.5 && !preparing {
             return Follow::Stuck;
         }
-        let progress = dh + dy.abs();
+        let progress = dh_aim + dy.abs();
         if progress < self.best - 0.02 {
             self.best = progress;
             self.stalled = 0;
@@ -623,7 +701,7 @@ impl Follower {
             }
         }
 
-        let (to_x, to_z) = (s.pos[0] as f64 + 0.5 - pos[0], s.pos[2] as f64 + 0.5 - pos[2]);
+        let (to_x, to_z) = (aim[0] as f64 + 0.5 - pos[0], aim[2] as f64 + 0.5 - pos[2]);
         let (forward, back, left, right, yaw, hold) = match view_yaw {
             Some(view) => {
                 // Facing: where the camera is after this tick's turn, if a
@@ -637,10 +715,11 @@ impl Follower {
                         face = view + turn;
                         turned = Some(face);
                     }
-                    // Wait for the camera on the jump itself, not on the walk to it.
-                    hold = on_jump && wrap_degrees(heading - face).abs() > ALIGN_DEGREES;
+                    // Wait for the camera on the jump itself, not on the walk
+                    // to it or to its runway.
+                    hold = on_jump && !preparing && wrap_degrees(heading - face).abs() > ALIGN_DEGREES;
                 }
-                let (f, b, l, r) = if hold || dh <= 0.05 {
+                let (f, b, l, r) = if hold || dh_aim <= 0.05 {
                     (false, false, false, false)
                 } else {
                     wasd(face, to_x, to_z)
@@ -652,7 +731,7 @@ impl Follower {
                 false,
                 false,
                 false,
-                if dh > 0.05 { Some(yaw_to(to_x, to_z)) } else { None },
+                if dh_aim > 0.05 { Some(yaw_to(to_x, to_z)) } else { None },
                 false,
             ),
         };
@@ -663,14 +742,18 @@ impl Follower {
                     .abs()
                     .max((s.pos[2] - self.from[2]).abs());
                 let gap = (span - 1).max(0) as f64;
-                on_ground && !hold && dh <= gap + 0.65
+                on_ground && !hold && !preparing && dh <= gap + 0.65
             }
             Kind::Swim => dy > 0.2 || (in_water && dy > -0.5),
             Kind::Traverse | Kind::Diagonal => in_water,
             Kind::Descend => false,
         };
         // Sprinting needs the forward key.
-        let sprint = ((self.sprint && s.kind != Kind::Swim) || s.kind == Kind::Parkour) && forward;
+        let sprint = ((self.sprint && s.kind != Kind::Swim)
+            || s.kind == Kind::Parkour
+            || self.running)
+            && forward
+            && !preparing;
         Follow::Moving(Controls {
             forward,
             back,
@@ -681,6 +764,45 @@ impl Follower {
             yaw,
         })
     }
+}
+
+/// One line saying what a plan is made of: `/path debug on` prints it.
+#[allow(dead_code)]
+pub fn summarize_plan(start: Pos, goal: Goal, path: &Path) -> String {
+    const NAMES: [(Kind, &str); 6] = [
+        (Kind::Traverse, "walk"),
+        (Kind::Diagonal, "diagonal"),
+        (Kind::Ascend, "climb"),
+        (Kind::Descend, "drop"),
+        (Kind::Parkour, "sprint jump"),
+        (Kind::Swim, "swim"),
+    ];
+    let mut parts = Vec::new();
+    for (kind, name) in NAMES {
+        let n = path.steps.iter().filter(|s| s.kind == kind).count();
+        if n > 0 {
+            parts.push(format!("{n} {name}"));
+        }
+    }
+    let mut gaps = Vec::new();
+    let mut at = start;
+    for s in &path.steps {
+        if s.kind == Kind::Parkour {
+            let span = (s.pos[0] - at[0]).abs().max((s.pos[2] - at[2]).abs());
+            gaps.push((span - 1).to_string());
+        }
+        at = s.pos;
+    }
+    if !gaps.is_empty() {
+        parts.push(format!("jump gaps: {}", gaps.join(", ")));
+    }
+    let end = path.steps.last().map_or(start, |s| s.pos);
+    let how = if path.complete {
+        "reaches the goal".to_string()
+    } else {
+        format!("stops about {:.0} blocks short of the goal, then plans again", goal.heuristic(end))
+    };
+    format!("Plan of {} steps ({}); {how}", path.steps.len(), parts.join(", "))
 }
 
 #[allow(dead_code)]
@@ -711,6 +833,7 @@ pub struct Pather {
     replans: u32,
     per_tick: usize,
     pub sprint: bool,
+    note: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -723,6 +846,7 @@ impl Pather {
             replans: 0,
             per_tick: 400,
             sprint: true,
+            note: None,
         }
     }
 
@@ -734,6 +858,11 @@ impl Pather {
 
     pub fn goal(&self) -> Goal {
         self.goal
+    }
+
+    /// A line describing the plan just made, once (with `announce_plans`).
+    pub fn take_note(&mut self) -> Option<String> {
+        self.note.take()
     }
 
     /// One line for `/path status`.
@@ -781,6 +910,9 @@ impl Pather {
                     let path = search.take_path();
                     match path {
                         Some(p) => {
+                            if self.opts.announce_plans {
+                                self.note = Some(summarize_plan(here, self.goal, &p));
+                            }
                             self.phase = Phase::Following {
                                 follower: Follower::new(here, p.steps, self.sprint),
                                 complete: p.complete,
@@ -880,6 +1012,7 @@ pub enum Setting {
     Diagonal(bool),
     Sprint(bool),
     Look(bool),
+    Debug(bool),
     MaxFall(i32),
     MaxNodes(usize),
 }
@@ -895,7 +1028,7 @@ pub enum Cmd {
 }
 
 #[allow(dead_code)]
-pub const HELP: [&str; 7] = [
+pub const HELP: [&str; 8] = [
     "/goto <x> <y> <z>  walk to a block; ~ is relative to you (/goto ~10 ~ ~)",
     "/goto <x> <z>  walk to a column, at any height",
     "/goto <x> <y> <z> <radius>  get within a radius of a block",
@@ -903,6 +1036,7 @@ pub const HELP: [&str; 7] = [
     "/path parkour|swim|diagonal|sprint|look on|off",
     "  look on: always turn the camera toward the target (off: only to line up a sprint jump)",
     "/path fall <blocks> | nodes <count>",
+    "/path debug on|off  describe each plan in chat (how many sprint jumps, how long the gaps)",
 ];
 
 #[allow(dead_code)]
@@ -963,13 +1097,14 @@ fn parse_path(rest: &[&str]) -> Result<Cmd, String> {
         [] | ["help"] => Ok(Cmd::Help),
         ["stop"] => Ok(Cmd::Stop),
         ["status"] => Ok(Cmd::Status),
-        [name @ ("parkour" | "swim" | "diagonal" | "sprint" | "look"), value] => {
+        [name @ ("parkour" | "swim" | "diagonal" | "sprint" | "look" | "debug"), value] => {
             let on = flag(value).ok_or_else(|| format!("/path {name} takes on or off"))?;
             Ok(Cmd::Set(match *name {
                 "parkour" => Setting::Parkour(on),
                 "swim" => Setting::Swim(on),
                 "diagonal" => Setting::Diagonal(on),
                 "look" => Setting::Look(on),
+                "debug" => Setting::Debug(on),
                 _ => Setting::Sprint(on),
             }))
         }
@@ -994,6 +1129,7 @@ pub fn apply_setting(opts: &mut Options, sprint: &mut bool, setting: &Setting) {
         Setting::Diagonal(v) => opts.allow_diagonal = v,
         Setting::Sprint(v) => *sprint = v,
         Setting::Look(v) => opts.turn_camera = v,
+        Setting::Debug(v) => opts.announce_plans = v,
         Setting::MaxFall(v) => opts.max_fall = v,
         Setting::MaxNodes(v) => opts.max_nodes = v,
     }
@@ -1397,6 +1533,176 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    fn jump_world(pit: std::ops::RangeInclusive<i32>, cut_runway_at: Option<i32>) -> Mock {
+        let mut w = Mock::new();
+        for x in pit {
+            for z in -12..=12 {
+                for y in -3..=0 {
+                    w.set([x, y, z], Cell::Air);
+                }
+            }
+        }
+        if let Some(cut) = cut_runway_at {
+            for x in -12..=cut {
+                for z in -12..=12 {
+                    for y in -3..=0 {
+                        w.set([x, y, z], Cell::Air);
+                    }
+                }
+            }
+        }
+        w
+    }
+
+    fn parkour_options() -> Options {
+        let mut o = Options::default();
+        o.allow_parkour = true;
+        o
+    }
+
+    #[test]
+    fn run_up_grows_with_the_gap() {
+        assert_eq!(run_up(1), 0);
+        assert_eq!(run_up(2), 2);
+        assert_eq!(run_up(3), 3);
+    }
+
+    #[test]
+    fn plans_a_three_block_gap_with_a_runway() {
+        let w = jump_world(2..=4, None);
+        let p = find_path(&w, START, Goal::Exact([5, 1, 0]), parkour_options()).unwrap();
+        assert!(p.complete);
+        let at = p.steps.iter().position(|s| s.kind == Kind::Parkour).unwrap();
+        assert_eq!(p.steps[at].pos, [5, 1, 0]);
+        assert_eq!(p.steps[at - 1].pos, [1, 1, 0]); // takes off from the pit's edge
+    }
+
+    #[test]
+    fn no_three_block_jump_without_a_runway() {
+        // Blocks 0 and below are void, so the edge block at x = 1 has no runway.
+        let w = jump_world(2..=4, Some(0));
+        let p = find_path(&w, [1, 1, 0], Goal::Exact([5, 1, 0]), parkour_options());
+        assert!(p.map_or(true, |p| !p.complete));
+    }
+
+    #[test]
+    fn a_two_block_gap_needs_two_blocks_of_runway() {
+        let w = jump_world(2..=3, Some(-1)); // runway: x = 0 only
+        let p = find_path(&w, [1, 1, 0], Goal::Exact([4, 1, 0]), parkour_options());
+        assert!(p.map_or(true, |p| !p.complete));
+        let w = jump_world(2..=3, Some(-2)); // runway: x = -1 and 0
+        let p = find_path(&w, [1, 1, 0], Goal::Exact([4, 1, 0]), parkour_options()).unwrap();
+        assert!(p.complete && p.steps.iter().any(|s| s.kind == Kind::Parkour));
+    }
+
+    #[test]
+    fn four_block_gaps_are_out_of_reach() {
+        let w = jump_world(2..=5, None);
+        let p = find_path(&w, START, Goal::Exact([6, 1, 0]), parkour_options());
+        assert!(p.map_or(true, |p| !p.complete));
+    }
+
+    #[test]
+    fn plan_summary_names_the_jumps() {
+        let w = jump_world(2..=4, None);
+        let goal = Goal::Exact([5, 1, 0]);
+        let p = find_path(&w, START, goal, parkour_options()).unwrap();
+        let text = summarize_plan(START, goal, &p);
+        assert!(text.contains("1 sprint jump"), "{text}");
+        assert!(text.contains("jump gaps: 3"), "{text}");
+        assert!(text.contains("reaches the goal"), "{text}");
+        let partial = find_path(&w, START, Goal::Exact([9, 1, 0]), Options::default()).unwrap();
+        assert!(summarize_plan(START, Goal::Exact([9, 1, 0]), &partial).contains("short of the goal"));
+    }
+
+    #[test]
+    fn pather_announces_plans_only_when_asked() {
+        let w = jump_world(2..=4, None);
+        let mut o = parkour_options();
+        let mut p = Pather::new(Goal::Exact([5, 1, 0]), o.clone());
+        p.tick(&w, [0.5, 1.0, 0.5], true, false, Some(-90.0));
+        assert_eq!(p.take_note(), None);
+        o.announce_plans = true;
+        let mut p = Pather::new(Goal::Exact([5, 1, 0]), o);
+        p.tick(&w, [0.5, 1.0, 0.5], true, false, Some(-90.0));
+        let note = p.take_note().unwrap();
+        assert!(note.contains("jump gaps: 3"), "{note}");
+        assert_eq!(p.take_note(), None, "said once");
+    }
+
+    #[test]
+    fn debug_setting_parses() {
+        assert_eq!(parsed("path debug on"), Ok(Cmd::Set(Setting::Debug(true))));
+    }
+
+    #[test]
+    fn a_two_block_gap_starts_by_walking_back_for_a_run_up() {
+        // At the takeoff, facing the gap (east), with a gap of two to clear.
+        let steps = vec![Step { pos: [3, 1, 0], kind: Kind::Parkour }];
+        let mut f = Follower::new(START, steps, false);
+        let c = moving(f.update([0.5, 1.0, 0.5], true, false, Some(-90.0)));
+        assert!(c.back && !c.forward, "walks back to the runway: {c:?}");
+        assert!(!c.jump && !c.sprint);
+        // At the start of the runway (two blocks back): runs up, sprinting, no jump yet.
+        let c = moving(f.update([-1.5, 1.0, 0.5], true, false, Some(-90.0)));
+        assert!(c.forward && c.sprint && !c.jump, "{c:?}");
+        // Still running at the takeoff's middle: not turned around again.
+        let c = moving(f.update([0.5, 1.0, 0.5], true, false, Some(-90.0)));
+        assert!(c.forward && c.sprint && !c.back && !c.jump, "{c:?}");
+        // Close to the edge it jumps.
+        let c = moving(f.update([0.95, 1.0, 0.5], true, false, Some(-90.0)));
+        assert!(c.jump && c.forward && c.sprint, "{c:?}");
+    }
+
+    #[test]
+    fn arriving_along_the_runway_means_no_turning_back() {
+        // Three walking steps along the runway, then a two-block jump.
+        let steps = vec![
+            Step { pos: [-2, 1, 0], kind: Kind::Traverse },
+            Step { pos: [-1, 1, 0], kind: Kind::Traverse },
+            Step { pos: [0, 1, 0], kind: Kind::Traverse },
+            Step { pos: [3, 1, 0], kind: Kind::Parkour },
+        ];
+        let mut f = Follower::new([-3, 1, 0], steps, false);
+        // Already two or more blocks back and in line: runs (sprinting) from the start.
+        let c = moving(f.update([-2.5, 1.0, 0.5], true, false, Some(-90.0)));
+        assert!(c.sprint && c.forward, "{c:?}");
+        // Walking on through every block, the jump step at the takeoff does
+        // not send it back for a run-up.
+        for x in [-1.5, -0.5] {
+            let c = moving(f.update([x, 1.0, 0.5], true, false, Some(-90.0)));
+            assert!(c.forward && c.sprint, "at {x}: {c:?}");
+        }
+        let c = moving(f.update([0.5, 1.0, 0.5], true, false, Some(-90.0)));
+        assert!(c.forward && c.sprint && !c.back && !c.jump, "at the takeoff: {c:?}");
+        assert_eq!(f.remaining(), 1);
+        let c = moving(f.update([0.95, 1.0, 0.5], true, false, Some(-90.0)));
+        assert!(c.jump && c.forward && c.sprint, "at the edge: {c:?}");
+    }
+
+    #[test]
+    fn a_one_block_gap_needs_no_run_up() {
+        let steps = vec![Step { pos: [2, 1, 0], kind: Kind::Parkour }];
+        let mut f = Follower::new(START, steps, false);
+        let c = moving(f.update([0.5, 1.0, 0.5], true, false, Some(-90.0)));
+        assert!(c.forward && !c.back, "{c:?}");
+    }
+
+    #[test]
+    fn running_is_lost_when_knocked_off_the_runway_line() {
+        let steps = vec![
+            Step { pos: [0, 1, 0], kind: Kind::Traverse },
+            Step { pos: [3, 1, 0], kind: Kind::Parkour },
+        ];
+        let mut f = Follower::new([-3, 1, 0], steps, false);
+        let c = moving(f.update([-2.5, 1.0, 0.5], true, false, Some(-90.0)));
+        assert!(c.sprint);
+        // Thrown a block and a half sideways: it no longer counts as running up.
+        let c = moving(f.update([-1.0, 1.0, 2.0], true, false, Some(-90.0)));
+        assert!(!c.sprint || c.right || c.left || c.forward || c.back);
+        assert!(!f.running);
     }
 
     fn moving(f: Follow) -> Controls {

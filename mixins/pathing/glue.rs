@@ -111,6 +111,9 @@ pub(super) fn tick(game: &mut Game<'_>) {
     let in_water = m::WorldView::cell(&world, m::node_at(pos)) == m::Cell::Water;
     let view_yaw = if options().turn_camera { None } else { Some(player.yaw) };
     let tick = pather.tick(&world, pos, on_ground, in_water, view_yaw);
+    if let Some(note) = pather.take_note() {
+        game.native_chat(&note);
+    }
     match tick {
         m::Tick::Controls(c) => {
             apply(game, c);
@@ -126,7 +129,7 @@ pub(super) fn tick(game: &mut Game<'_>) {
         m::Tick::Failed => {
             release(game);
             game.native_chat(&format!(
-                "No way found to {}: is it loaded and reachable? (/path help)",
+                "No way found to {}: is it loaded and reachable? (/path debug on shows each plan)",
                 goal_text(pather.goal())
             ));
             return;
