@@ -57,6 +57,9 @@ pub struct Options {
     pub water_cost: f64,
     /// Most nodes one search expands before it settles for a partial path.
     pub max_nodes: usize,
+    /// Turn the camera toward the target and walk forward, instead of leaving
+    /// the camera alone and steering with W, A, S and D.
+    pub turn_camera: bool,
 }
 
 #[allow(dead_code)]
@@ -69,6 +72,7 @@ impl Default for Options {
             allow_swim: true,
             water_cost: 2.0,
             max_nodes: 20_000,
+            turn_camera: false,
         }
     }
 }
@@ -468,13 +472,37 @@ pub fn yaw_to(dx: f64, dz: f64) -> f32 {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Controls {
     pub forward: bool,
+    pub back: bool,
+    pub left: bool,
+    pub right: bool,
     pub jump: bool,
     pub sprint: bool,
-    /// Where to face; none when already on the target.
+    /// Where to turn the camera: only when asked to (`Options::turn_camera`).
     pub yaw: Option<f32>,
 }
 
 #[allow(dead_code)]
+#[allow(dead_code)]
+/// Which of W, S, A and D (forward, back, left, right) move a player looking
+/// along `view_yaw` toward (dx, dz): the nearest of the eight directions.
+pub fn wasd(view_yaw: f32, dx: f64, dz: f64) -> (bool, bool, bool, bool) {
+    let len = (dx * dx + dz * dz).sqrt();
+    if len < 1e-6 {
+        return (false, false, false, false);
+    }
+    let (dx, dz) = (dx / len, dz / len);
+    let r = f64::from(view_yaw).to_radians();
+    let ahead = -dx * r.sin() + dz * r.cos();
+    let to_right = -dx * r.cos() - dz * r.sin();
+    const SIN_22_5: f64 = 0.3827;
+    (
+        ahead > SIN_22_5,
+        ahead < -SIN_22_5,
+        to_right < -SIN_22_5,
+        to_right > SIN_22_5,
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Follow {
     Moving(Controls),
@@ -511,7 +539,16 @@ impl Follower {
         self.steps.len() - self.next
     }
 
-    pub fn update(&mut self, pos: [f64; 3], on_ground: bool, in_water: bool) -> Follow {
+    /// `view_yaw` is where the camera points now: with it, the controls steer
+    /// with W, A, S and D and never turn the camera; without it, they ask for
+    /// a yaw and walk forward.
+    pub fn update(
+        &mut self,
+        pos: [f64; 3],
+        on_ground: bool,
+        in_water: bool,
+        view_yaw: Option<f32>,
+    ) -> Follow {
         let horizontal = |p: Pos| -> f64 {
             let dx = p[0] as f64 + 0.5 - pos[0];
             let dz = p[2] as f64 + 0.5 - pos[2];
@@ -551,13 +588,17 @@ impl Follower {
             }
         }
 
-        let yaw = if dh > 0.05 {
-            Some(yaw_to(
-                s.pos[0] as f64 + 0.5 - pos[0],
-                s.pos[2] as f64 + 0.5 - pos[2],
-            ))
-        } else {
-            None
+        let (to_x, to_z) = (s.pos[0] as f64 + 0.5 - pos[0], s.pos[2] as f64 + 0.5 - pos[2]);
+        let (forward, back, left, right, yaw) = match view_yaw {
+            Some(view) => {
+                let (f, b, l, r) = if dh > 0.05 {
+                    wasd(view, to_x, to_z)
+                } else {
+                    (false, false, false, false)
+                };
+                (f, b, l, r, None)
+            }
+            None => (true, false, false, false, if dh > 0.05 { Some(yaw_to(to_x, to_z)) } else { None }),
         };
         let jump = match s.kind {
             Kind::Ascend => dy > 0.5 && dh < 1.6 && on_ground,
@@ -572,10 +613,15 @@ impl Follower {
             Kind::Traverse | Kind::Diagonal => in_water,
             Kind::Descend => false,
         };
+        // Sprinting needs the forward key.
+        let sprint = ((self.sprint && s.kind != Kind::Swim) || s.kind == Kind::Parkour) && forward;
         Follow::Moving(Controls {
-            forward: true,
+            forward,
+            back,
+            left,
+            right,
             jump,
-            sprint: (self.sprint && s.kind != Kind::Swim) || s.kind == Kind::Parkour,
+            sprint,
             yaw,
         })
     }
@@ -655,6 +701,7 @@ impl Pather {
         pos: [f64; 3],
         on_ground: bool,
         in_water: bool,
+        view_yaw: Option<f32>,
     ) -> Tick {
         let here = node_at(pos);
         if let Phase::Done(t) = self.phase {
@@ -695,7 +742,7 @@ impl Pather {
         let mut replan = false;
         let mut finished = None;
         if let Phase::Following { follower, complete, from } = &mut self.phase {
-            match follower.update(pos, on_ground, in_water) {
+            match follower.update(pos, on_ground, in_water, view_yaw) {
                 Follow::Moving(c) => return Tick::Controls(c),
                 Follow::Arrived => {
                     if *complete {
@@ -776,6 +823,7 @@ pub enum Setting {
     Swim(bool),
     Diagonal(bool),
     Sprint(bool),
+    Look(bool),
     MaxFall(i32),
     MaxNodes(usize),
 }
@@ -791,12 +839,13 @@ pub enum Cmd {
 }
 
 #[allow(dead_code)]
-pub const HELP: [&str; 6] = [
+pub const HELP: [&str; 7] = [
     "/goto <x> <y> <z>  walk to a block; ~ is relative to you (/goto ~10 ~ ~)",
     "/goto <x> <z>  walk to a column, at any height",
     "/goto <x> <y> <z> <radius>  get within a radius of a block",
     "/path stop | status",
-    "/path parkour|swim|diagonal|sprint on|off",
+    "/path parkour|swim|diagonal|sprint|look on|off",
+    "  look on: turn the camera toward the target (off: steer with W A S D; sprint-jumps then need the gap in front of you)",
     "/path fall <blocks> | nodes <count>",
 ];
 
@@ -858,12 +907,13 @@ fn parse_path(rest: &[&str]) -> Result<Cmd, String> {
         [] | ["help"] => Ok(Cmd::Help),
         ["stop"] => Ok(Cmd::Stop),
         ["status"] => Ok(Cmd::Status),
-        [name @ ("parkour" | "swim" | "diagonal" | "sprint"), value] => {
+        [name @ ("parkour" | "swim" | "diagonal" | "sprint" | "look"), value] => {
             let on = flag(value).ok_or_else(|| format!("/path {name} takes on or off"))?;
             Ok(Cmd::Set(match *name {
                 "parkour" => Setting::Parkour(on),
                 "swim" => Setting::Swim(on),
                 "diagonal" => Setting::Diagonal(on),
+                "look" => Setting::Look(on),
                 _ => Setting::Sprint(on),
             }))
         }
@@ -887,6 +937,7 @@ pub fn apply_setting(opts: &mut Options, sprint: &mut bool, setting: &Setting) {
         Setting::Swim(v) => opts.allow_swim = v,
         Setting::Diagonal(v) => opts.allow_diagonal = v,
         Setting::Sprint(v) => *sprint = v,
+        Setting::Look(v) => opts.turn_camera = v,
         Setting::MaxFall(v) => opts.max_fall = v,
         Setting::MaxNodes(v) => opts.max_nodes = v,
     }
@@ -1159,21 +1210,22 @@ mod tests {
     fn follower_walks_then_arrives() {
         let steps = vec![Step { pos: [1, 1, 0], kind: Kind::Traverse }];
         let mut f = Follower::new(START, steps, false);
-        match f.update([0.5, 1.0, 0.5], true, false) {
+        // Turning the camera: face east and walk forward.
+        match f.update([0.5, 1.0, 0.5], true, false, None) {
             Follow::Moving(c) => {
-                assert!(c.forward && !c.jump && !c.sprint);
+                assert!(c.forward && !c.back && !c.left && !c.right && !c.jump && !c.sprint);
                 assert!((c.yaw.unwrap() + 90.0).abs() < 1e-3);
             }
             other => panic!("{other:?}"),
         }
-        assert_eq!(f.update([1.5, 1.0, 0.5], true, false), Follow::Arrived);
+        assert_eq!(f.update([1.5, 1.0, 0.5], true, false, None), Follow::Arrived);
     }
 
     #[test]
     fn follower_jumps_for_an_ascend_only_near_it_and_on_the_ground() {
         let steps = vec![Step { pos: [3, 2, 0], kind: Kind::Ascend }];
         let mut f = Follower::new(START, steps, false);
-        let jump = |f: &mut Follower, p: [f64; 3], ground: bool| match f.update(p, ground, false) {
+        let jump = |f: &mut Follower, p: [f64; 3], ground: bool| match f.update(p, ground, false, None) {
             Follow::Moving(c) => c.jump,
             other => panic!("{other:?}"),
         };
@@ -1186,7 +1238,7 @@ mod tests {
     fn follower_jumps_a_gap_at_the_edge() {
         let steps = vec![Step { pos: [2, 1, 0], kind: Kind::Parkour }];
         let mut f = Follower::new(START, steps, false);
-        let moving = |f: &mut Follower, x: f64| match f.update([x, 1.0, 0.5], true, false) {
+        let moving = |f: &mut Follower, x: f64| match f.update([x, 1.0, 0.5], true, false, None) {
             Follow::Moving(c) => c,
             other => panic!("{other:?}"),
         };
@@ -1201,7 +1253,7 @@ mod tests {
         let mut f = Follower::new(START, steps, false);
         let mut result = Follow::Arrived;
         for _ in 0..70 {
-            result = f.update([0.5, 1.0, 0.5], true, false);
+            result = f.update([0.5, 1.0, 0.5], true, false, None);
             if result == Follow::Stuck {
                 break;
             }
@@ -1213,23 +1265,121 @@ mod tests {
     fn follower_reports_stuck_when_far_off_the_path() {
         let steps = vec![Step { pos: [1, 1, 0], kind: Kind::Traverse }];
         let mut f = Follower::new(START, steps, false);
-        assert_eq!(f.update([20.0, 1.0, 20.0], true, false), Follow::Stuck);
+        assert_eq!(f.update([20.0, 1.0, 20.0], true, false, None), Follow::Stuck);
     }
 
-    // A toy player: walks along its yaw, and snaps to a step's height once
-    // it is on top of it.
-    fn simulate(w: &Mock, pather: &mut Pather, mut pos: [f64; 3], max_ticks: usize) -> (Tick, [f64; 3]) {
-        let mut target_y = pos[1];
+    #[test]
+    fn wasd_picks_keys_relative_to_the_camera() {
+        // Facing south (yaw 0): +z is ahead, -z behind, +x on the left, -x on the right.
+        assert_eq!(wasd(0.0, 0.0, 5.0), (true, false, false, false));
+        assert_eq!(wasd(0.0, 0.0, -5.0), (false, true, false, false));
+        assert_eq!(wasd(0.0, 5.0, 0.0), (false, false, true, false));
+        assert_eq!(wasd(0.0, -5.0, 0.0), (false, false, false, true));
+        assert_eq!(wasd(0.0, 3.0, 3.0), (true, false, true, false)); // ahead and left
+        assert_eq!(wasd(0.0, -3.0, -3.0), (false, true, false, true));
+        // Facing east (yaw -90): +x is ahead.
+        assert_eq!(wasd(-90.0, 5.0, 0.0), (true, false, false, false));
+        // Facing west (yaw 90): +x is behind.
+        assert_eq!(wasd(90.0, 5.0, 0.0), (false, true, false, false));
+        // Nowhere to go: no keys.
+        assert_eq!(wasd(40.0, 0.0, 0.0), (false, false, false, false));
+    }
+
+    #[test]
+    fn wasd_never_presses_opposite_keys() {
+        for yaw in (-180..180).step_by(7) {
+            for a in 0..360 {
+                let r = f64::from(a).to_radians();
+                let (f, b, l, rt) = wasd(yaw as f32, r.cos(), r.sin());
+                assert!(!(f && b) && !(l && rt));
+                assert!(f || b || l || rt, "no key at yaw {yaw}, angle {a}");
+            }
+        }
+    }
+
+    #[test]
+    fn wasd_is_within_a_quarter_turn_of_the_target() {
+        // The keys move the player in one of eight directions: never more
+        // than 22.5 degrees off.
+        for yaw in [-170.0f32, -45.0, 0.0, 33.0, 90.0, 151.0] {
+            for a in 0..360 {
+                let t = f64::from(a).to_radians();
+                let (dx, dz) = (t.cos(), t.sin());
+                let (f, b, l, r) = wasd(yaw, dx, dz);
+                let v = f64::from(yaw).to_radians();
+                let fwd = (-v.sin(), v.cos());
+                let rgt = (-v.cos(), -v.sin());
+                let (a1, a2) = (
+                    f64::from(f as i32 - b as i32),
+                    f64::from(r as i32 - l as i32),
+                );
+                let (mx, mz) = (a1 * fwd.0 + a2 * rgt.0, a1 * fwd.1 + a2 * rgt.1);
+                let cos = (mx * dx + mz * dz) / (mx * mx + mz * mz).sqrt();
+                assert!(cos > 0.92, "yaw {yaw} angle {a}: cos {cos}"); // cos 22.5 = 0.924
+            }
+        }
+    }
+
+    #[test]
+    fn follower_steers_with_keys_and_leaves_the_camera_alone() {
+        let steps = vec![Step { pos: [3, 1, 0], kind: Kind::Traverse }];
+        let mut f = Follower::new(START, steps, true);
+        // Looking south, the target is to the east: strafe left, no yaw, no sprint.
+        match f.update([0.5, 1.0, 0.5], true, false, Some(0.0)) {
+            Follow::Moving(c) => {
+                assert!(c.left && !c.forward && !c.right && !c.back);
+                assert_eq!(c.yaw, None);
+                assert!(!c.sprint, "sprinting needs the forward key");
+            }
+            other => panic!("{other:?}"),
+        }
+        // Looking east at the same target: forward, sprinting.
+        match f.update([0.5, 1.0, 0.5], true, false, Some(-90.0)) {
+            Follow::Moving(c) => {
+                assert!(c.forward && !c.left && !c.right && c.sprint);
+                assert_eq!(c.yaw, None);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // A toy player. With `view` it keeps its camera fixed and moves by the
+    // keys the controls press; without, it turns toward the target and walks
+    // forward. It steps 0.25 a tick and stands on whatever is under its feet.
+    fn simulate(
+        w: &Mock,
+        pather: &mut Pather,
+        mut pos: [f64; 3],
+        view: Option<f32>,
+        max_ticks: usize,
+    ) -> (Tick, [f64; 3]) {
         for _ in 0..max_ticks {
-            match pather.tick(w, pos, true, false) {
+            match pather.tick(w, pos, true, false, view) {
                 Tick::Controls(c) => {
-                    if let Some(yaw) = c.yaw {
-                        let r = (yaw as f64).to_radians();
-                        pos[0] += -r.sin() * 0.25;
-                        pos[2] += r.cos() * 0.25;
+                    let (mut mx, mut mz) = (0.0f64, 0.0f64);
+                    match view {
+                        Some(v) => {
+                            assert_eq!(c.yaw, None, "the camera must stay put");
+                            let r = f64::from(v).to_radians();
+                            let a = f64::from(c.forward as i32 - c.back as i32);
+                            let b = f64::from(c.right as i32 - c.left as i32);
+                            mx = a * -r.sin() + b * -r.cos();
+                            mz = a * r.cos() + b * -r.sin();
+                        }
+                        None => {
+                            if let Some(yaw) = c.yaw {
+                                let r = f64::from(yaw).to_radians();
+                                mx = -r.sin();
+                                mz = r.cos();
+                            }
+                        }
+                    }
+                    let len = (mx * mx + mz * mz).sqrt();
+                    if len > 0.0 {
+                        pos[0] += mx / len * 0.25;
+                        pos[2] += mz / len * 0.25;
                     }
                     let n = node_at(pos);
-                    // Stand on whatever is under the feet.
                     let mut y = n[1];
                     while w.cell([n[0], y, n[2]]) == Cell::Solid {
                         y += 1;
@@ -1237,14 +1387,12 @@ mod tests {
                     while w.cell([n[0], y - 1, n[2]]) == Cell::Air {
                         y -= 1;
                     }
-                    target_y = y as f64;
-                    pos[1] = target_y;
+                    pos[1] = y as f64;
                 }
                 Tick::Idle => {}
                 done => return (done, pos),
             }
         }
-        let _ = target_y;
         (Tick::Idle, pos)
     }
 
@@ -1257,9 +1405,25 @@ mod tests {
         }
         w.set([1, 1, 0], Cell::Solid); // a step on the way
         let mut p = Pather::new(Goal::Exact([6, 1, 0]), Options::default());
-        let (t, end) = simulate(&w, &mut p, [0.5, 1.0, 0.5], 2_000);
+        let (t, end) = simulate(&w, &mut p, [0.5, 1.0, 0.5], None, 2_000);
         assert_eq!(t, Tick::Arrived, "ended at {end:?}");
         assert_eq!(node_at(end), [6, 1, 0]);
+    }
+
+    #[test]
+    fn pather_arrives_with_a_fixed_camera_in_any_direction() {
+        let mut w = Mock::new();
+        for z in -5..=5 {
+            w.set([3, 1, z], Cell::Solid);
+            w.set([3, 2, z], Cell::Solid);
+        }
+        w.set([1, 1, 0], Cell::Solid);
+        for view in [0.0f32, 37.0, 90.0, -120.0, 180.0] {
+            let mut p = Pather::new(Goal::Exact([6, 1, 0]), Options::default());
+            let (t, end) = simulate(&w, &mut p, [0.5, 1.0, 0.5], Some(view), 3_000);
+            assert_eq!(t, Tick::Arrived, "camera {view}: ended at {end:?}");
+            assert_eq!(node_at(end), [6, 1, 0], "camera {view}");
+        }
     }
 
     #[test]
@@ -1268,8 +1432,15 @@ mod tests {
         let mut o = Options::default();
         o.max_nodes = 12; // too few to find the whole way at once
         let mut p = Pather::new(Goal::Exact([9, 1, 0]), o);
-        let (t, end) = simulate(&w, &mut p, [0.5, 1.0, 0.5], 4_000);
+        let (t, end) = simulate(&w, &mut p, [0.5, 1.0, 0.5], None, 4_000);
         assert_eq!(t, Tick::Arrived, "ended at {end:?}");
+        let mut p = Pather::new(Goal::Exact([9, 1, 0]), {
+            let mut o = Options::default();
+            o.max_nodes = 12;
+            o
+        });
+        let (t, end) = simulate(&w, &mut p, [0.5, 1.0, 0.5], Some(55.0), 4_000);
+        assert_eq!(t, Tick::Arrived, "fixed camera: ended at {end:?}");
     }
 
     #[test]
@@ -1280,7 +1451,7 @@ mod tests {
             w.set([*dx, 2, *dz], Cell::Solid);
         }
         let mut p = Pather::new(Goal::Exact([5, 1, 0]), Options::default());
-        let (t, _) = simulate(&w, &mut p, [0.5, 1.0, 0.5], 100);
+        let (t, _) = simulate(&w, &mut p, [0.5, 1.0, 0.5], None, 100);
         assert_eq!(t, Tick::Failed);
     }
     #[test]
@@ -1345,6 +1516,7 @@ mod tests {
         assert_eq!(parsed("path"), Ok(Cmd::Help));
         assert_eq!(parsed("path parkour on"), Ok(Cmd::Set(Setting::Parkour(true))));
         assert_eq!(parsed("path swim off"), Ok(Cmd::Set(Setting::Swim(false))));
+        assert_eq!(parsed("path look on"), Ok(Cmd::Set(Setting::Look(true))));
         assert_eq!(parsed("path fall 5"), Ok(Cmd::Set(Setting::MaxFall(5))));
         assert_eq!(parsed("path nodes 5000"), Ok(Cmd::Set(Setting::MaxNodes(5000))));
         assert!(parsed("path fall 99").is_err());
@@ -1368,7 +1540,7 @@ mod tests {
         let w = Mock::new();
         let mut p = Pather::new(Goal::Exact([4, 1, 0]), Options::default());
         assert_eq!(p.describe(), "about to plan");
-        p.tick(&w, [0.5, 1.0, 0.5], true, false);
+        p.tick(&w, [0.5, 1.0, 0.5], true, false, None);
         assert!(p.describe().contains("steps to go"), "{}", p.describe());
     }
 }

@@ -11,7 +11,14 @@ use horizon_client::blocks::Fluid;
 use std::cell::{Cell, RefCell};
 use winit::keyboard::KeyCode;
 
-const MOVE_KEYS: [KeyCode; 3] = [KeyCode::KeyW, KeyCode::Space, KeyCode::ControlLeft];
+const MOVE_KEYS: [KeyCode; 6] = [
+    KeyCode::KeyW,
+    KeyCode::KeyS,
+    KeyCode::KeyA,
+    KeyCode::KeyD,
+    KeyCode::Space,
+    KeyCode::ControlLeft,
+];
 
 thread_local! {
     static PATHER: RefCell<Option<m::Pather>> = const { RefCell::new(None) };
@@ -48,12 +55,22 @@ fn apply(game: &mut Game<'_>, c: m::Controls) {
     if c.forward {
         game.keys.insert(KeyCode::KeyW);
     }
+    if c.back {
+        game.keys.insert(KeyCode::KeyS);
+    }
+    if c.left {
+        game.keys.insert(KeyCode::KeyA);
+    }
+    if c.right {
+        game.keys.insert(KeyCode::KeyD);
+    }
     if c.sprint {
         game.keys.insert(KeyCode::ControlLeft);
     }
     if c.jump {
         game.keys.insert(KeyCode::Space);
     }
+    // Only `/path look on` turns the camera; otherwise the keys do the steering.
     if let Some(yaw) = c.yaw {
         game.yaw = yaw;
     }
@@ -92,7 +109,8 @@ pub(super) fn tick(game: &mut Game<'_>) {
     let on_ground = game.player.as_ref().is_some_and(|p| p.ground.on_ground);
     let world = GameWorld(&*game);
     let in_water = m::WorldView::cell(&world, m::node_at(pos)) == m::Cell::Water;
-    let tick = pather.tick(&world, pos, on_ground, in_water);
+    let view_yaw = if options().turn_camera { None } else { Some(player.yaw) };
+    let tick = pather.tick(&world, pos, on_ground, in_water, view_yaw);
     match tick {
         m::Tick::Controls(c) => {
             apply(game, c);
