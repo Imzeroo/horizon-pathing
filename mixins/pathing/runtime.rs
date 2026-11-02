@@ -14,7 +14,7 @@ use std::collections::{BinaryHeap, HashMap};
 #[allow(dead_code)]
 pub const ID: &str = "pathing";
 #[allow(dead_code)]
-pub const VERSION: &str = "0.1.3";
+pub const VERSION: &str = "0.1.0";
 
 #[allow(dead_code)]
 pub type Pos = [i32; 3];
@@ -1040,6 +1040,27 @@ pub const HELP: [&str; 8] = [
 ];
 
 #[allow(dead_code)]
+/// The commands as usages for the server's command tree (`native_server`'s
+/// syntax: words, then `<name:kind>` arguments), so the chat box completes
+/// them. Every one must be something `parse_command` accepts: a test checks it.
+#[allow(dead_code)]
+pub const USAGES: &[&str] = &[
+    "goto <pos:block_pos>",
+    "goto <pos:block_pos> <radius:number>",
+    "goto <x:integer> <z:integer>",
+    "path stop",
+    "path status",
+    "path help",
+    "path parkour <enabled:boolean>",
+    "path swim <enabled:boolean>",
+    "path diagonal <enabled:boolean>",
+    "path sprint <enabled:boolean>",
+    "path look <enabled:boolean>",
+    "path debug <enabled:boolean>",
+    "path fall <blocks:integer>",
+    "path nodes <count:integer>",
+];
+
 fn coord(word: &str, here: f64) -> Option<i32> {
     if let Some(rest) = word.strip_prefix('~') {
         let d = if rest.is_empty() { 0.0 } else { rest.parse::<f64>().ok()? };
@@ -1630,6 +1651,71 @@ mod tests {
         let note = p.take_note().unwrap();
         assert!(note.contains("jump gaps: 3"), "{note}");
         assert_eq!(p.take_note(), None, "said once");
+    }
+
+    // The words a usage would be typed with, for the kinds the usages use.
+    fn sample(name: &str, kind: &str) -> &'static str {
+        match kind {
+            "block_pos" => "5 70 -9",
+            "integer" if name == "count" => "1000",
+            "number" => "2.5",
+            "integer" => "5",
+            "boolean" => "true",
+            other => panic!("no sample for kind {other}"),
+        }
+    }
+
+    #[test]
+    fn every_completion_usage_is_something_the_parser_accepts() {
+        for usage in USAGES {
+            let mut typed = Vec::new();
+            for word in usage.split_whitespace() {
+                match word.strip_prefix('<').and_then(|w| w.strip_suffix('>')) {
+                    Some(arg) => {
+                        let (name, kind) = arg.split_once(':').expect("name:kind");
+                        typed.push(sample(name, kind));
+                    }
+                    None => typed.push(word),
+                }
+            }
+            let line = typed.join(" ");
+            let result = parse_command(&line, HERE);
+            assert!(matches!(result, Some(Ok(_))), "`{usage}` typed as `{line}`: {result:?}");
+        }
+    }
+
+    #[test]
+    fn usages_follow_the_servers_syntax() {
+        const KINDS: [&str; 4] = ["block_pos", "number", "integer", "boolean"];
+        for usage in USAGES {
+            let words: Vec<&str> = usage.split_whitespace().collect();
+            assert!(matches!(words[0], "goto" | "path"), "{usage}");
+            let mut args = false;
+            for w in &words {
+                if let Some(inner) = w.strip_prefix('<').and_then(|w| w.strip_suffix('>')) {
+                    let (name, kind) = inner.split_once(':').unwrap_or_else(|| panic!("{usage}"));
+                    assert!(!name.is_empty() && KINDS.contains(&kind), "{usage}");
+                    args = true;
+                } else {
+                    assert!(!args, "`{usage}`: a word after an argument");
+                    assert!(
+                        w.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-'),
+                        "`{usage}`: `{w}`"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_setting_the_parser_knows_has_a_usage() {
+        for name in ["parkour", "swim", "diagonal", "sprint", "look", "debug", "fall", "nodes", "stop", "status", "help"] {
+            assert!(
+                USAGES.iter().any(|u| u.starts_with(&format!("path {name}"))),
+                "no usage for /path {name}"
+            );
+        }
+        assert!(USAGES.iter().any(|u| u.starts_with("goto ")));
     }
 
     #[test]
