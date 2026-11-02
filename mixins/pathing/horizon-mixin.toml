@@ -1,6 +1,6 @@
 [mod]
 id = "pathing"
-version = "0.1.3"
+version = "0.1.4"
 priority = 100
 
 # The commit it was tested on. The glue reads fields of Game that are not hook

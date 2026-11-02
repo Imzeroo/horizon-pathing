@@ -14,7 +14,7 @@ use std::collections::{BinaryHeap, HashMap};
 #[allow(dead_code)]
 pub const ID: &str = "pathing";
 #[allow(dead_code)]
-pub const VERSION: &str = "0.1.0";
+pub const VERSION: &str = "0.1.4";
 
 #[allow(dead_code)]
 pub type Pos = [i32; 3];
