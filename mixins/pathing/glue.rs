@@ -65,7 +65,14 @@ fn apply(game: &mut Game<'_>, c: m::Controls) {
         game.keys.insert(KeyCode::KeyD);
     }
     if c.sprint {
+        // Ctrl is a toggle key: the game lets it go every frame while the real
+        // Ctrl is up, so a Ctrl put in `keys` never reaches the sprint logic.
+        // Once started, a sprint lasts while forward is held, so start it on
+        // the player, as that logic does (it stops it again when it should).
         game.keys.insert(KeyCode::ControlLeft);
+        if let Some(player) = game.player.as_mut() {
+            let _ = player.set_sprinting(true);
+        }
     }
     if c.jump {
         game.keys.insert(KeyCode::Space);
